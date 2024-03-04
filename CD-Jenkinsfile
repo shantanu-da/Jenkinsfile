@@ -1,1 +1,72 @@
+pipeline {
+    agent any
+    
+    tools {
+        terraform "terraform"
+    }
 
+    stages {
+        stage('Git checkout') {
+            steps {
+                git branch: 'shantanu', credentialsId: 'github', url: 'https://github.com/shantanu-da/helm-chart.git'
+            }
+        }
+        
+        stage('Terraform create GKE') {
+            environment {
+                GOOGLE_APPLICATION_CREDENTIALS = credentials('gcp-terraform-creds')
+                PROJECT_ID = "learning-414204"
+            }
+            steps {
+                withCredentials([file(credentialsId: 'gcp-terraform-creds', variable: 'gcp-credentials')]) {
+                    sh "terraform init"
+                    sh "terraform plan" 
+                    sh "terraform destroy -auto-approve" 
+                }
+            }
+        }
+        
+        stage('Deploy to GKE') {
+            environment {
+                GOOGLE_APPLICATION_CREDENTIALS = credentials('gcp-terraform-creds')
+            }
+            steps {
+                withCredentials([file(credentialsId: 'gcp-terraform-creds', variable: 'gcp-credentials')]) {
+                    sh "KUBECONFIG=/var/lib/jenkins/.kube/config gcloud container clusters get-credentials us-central1-gke --region us-central1 --project learning-414204"
+                    sh "kubectl get pods"
+                    
+                    // Check if Helm is installed
+                    script {
+                        def helmInstalled = sh(script: "helm version --short", returnStatus: true)
+                        if (helmInstalled == 0) {
+                            echo "Helm is already installed"
+                        } else {
+                            // Install Helm
+                            sh "curl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3"
+                            sh "chmod 700 get_helm.sh"
+                            sh "./get_helm.sh"
+                        }
+                    }
+                    
+                    // Build chart dependencies
+                    sh "helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx"
+                    sh "helm dependency build /var/lib/jenkins/workspace/CD/demo-app"
+                    
+                    // Check if demo-app is already installed
+                    script {
+                        def helmStatus = sh(script: "helm status demo-app", returnStatus: true)
+                        if (helmStatus == 0) {
+                            // Update the demo-app chart
+                            sh "gcloud auth activate-service-account --key-file=/var/lib/jenkins/workspace/CD/credentials.json"
+
+                            sh "helm upgrade demo-app /var/lib/jenkins/workspace/CD/demo-app --namespace default --values /var/lib/jenkins/workspace/CD/demo-app/values.yaml"
+                        } else {
+                            // Install demo-app chart
+                            sh "helm install demo-app /var/lib/jenkins/workspace/CD/demo-app --namespace default --values /var/lib/jenkins/workspace/CD/demo-app/values.yaml"
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
